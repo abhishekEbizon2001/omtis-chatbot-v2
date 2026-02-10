@@ -57,6 +57,18 @@ export const executeQuery = async (queryPlan) => {
 
         const pipeline = [...aggregation];
 
+        // CRITICAL FIX: Apply filters to aggregation pipeline
+        // Check if pipeline already has a $match stage at the beginning
+        const hasInitialMatch = pipeline.length > 0 && pipeline[0].$match !== undefined;
+
+        // If filters exist and no initial $match, prepend $match stage with filters
+        if (Object.keys(filters).length > 0 && !hasInitialMatch) {
+            pipeline.unshift({ $match: filters });
+        } else if (Object.keys(filters).length > 0 && hasInitialMatch) {
+            // If $match exists, merge filters with existing $match
+            pipeline[0].$match = { ...pipeline[0].$match, ...filters };
+        }
+
         // Check if pipeline already has $project stage
         const hasProject = pipeline.some(stage => stage.$project !== undefined);
 
