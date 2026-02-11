@@ -111,10 +111,28 @@ export const planQuery = async (req, res, next) => {
 
     // Handle clarification requests
     if (queryPlan.clarificationRequired) {
+      const prompt = `
+${userMessage}
+
+Classify this query into one of the following entities:
+1. inventoryitems
+2. salesorders
+3. customers
+
+Return ONLY valid JSON in this exact format:
+
+{
+  "entity": "inventoryitems" | "salesorders" | "customers",
+  "confidence": "low" | "medium" | "high"
+}
+`;
+      const answer = await generateQueryPlan(prompt)
+
       return res.json({
         success: true,
         clarificationRequired: true,
         queryPlan,
+        answer,
       });
     }
 

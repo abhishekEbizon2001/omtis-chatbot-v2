@@ -6,6 +6,52 @@ import { InventoryItemEnums, CustomerEnums } from "../config/enums.js";
 
 const ENTITY_MAP = { SalesOrder, Customer, InventoryItem };
 
+/**
+ * Validates that filters don't contain nested aggregation operators
+ * @param {Object} filters - The filters object from query plan
+ * @throws {Error} If invalid nesting is detected
+ */
+const validateFilters = (filters) => {
+    const aggregationOperators = ['$lookup', '$match', '$group', '$unwind', '$project', '$sort', '$limit', '$addFields', '$expr', '$facet', '$graphLookup'];
+    
+    const checkForNestedOperators = (obj, path = 'filters') => {
+        if (!obj || typeof obj !== 'object') return;
+        
+        for (const [key, value] of Object.entries(obj)) {
+            // Check if key is an aggregation operator
+            if (aggregationOperators.includes(key)) {
+                throw new Error(
+                    `Invalid query: Aggregation operator "${key}" cannot be used inside "${path}". ` +
+                    `Aggregation operators like $lookup, $match, $group must be in the "aggregation" array, not in "filters". ` +
+                    `Use "filters" only for simple field matching on the root entity.`
+                );
+            }
+            
+            // Check if value is an array containing aggregation operators
+            if (Array.isArray(value)) {
+                value.forEach((item, index) => {
+                    if (item && typeof item === 'object') {
+                        for (const itemKey of Object.keys(item)) {
+                            if (aggregationOperators.includes(itemKey)) {
+                                throw new Error(
+                                    `Invalid query: Aggregation operator "${itemKey}" found in "${path}.${key}[${index}]". ` +
+                                    `Cannot nest aggregation operators inside filter operators. ` +
+                                    `Move "$lookup", "$match", and other pipeline stages to the "aggregation" array.`
+                                );
+                            }
+                        }
+                        checkForNestedOperators(item, `${path}.${key}[${index}]`);
+                    }
+                });
+            } else if (value && typeof value === 'object') {
+                checkForNestedOperators(value, `${path}.${key}`);
+            }
+        }
+    };
+    
+    checkForNestedOperators(filters);
+};
+
 export const executeQuery = async (queryPlan) => {
     const { entity, filters = {}, aggregation = [], returnFields = [], limit = 100 } = queryPlan;
     const Model = ENTITY_MAP[entity];
@@ -14,26 +60,54 @@ export const executeQuery = async (queryPlan) => {
         throw new Error(`Unknown entity: ${entity}`);
     }
 
+    // Validate filters don't contain nested aggregation operators
+    validateFilters(filters);
+
     // Validate and fix limit - must be positive
     const validLimit = Math.max(1, limit || 100);
 
     // -----------------------------
     // ENUM VALIDATION
     // -----------------------------
+    const validateEnumField = (field, filterValue, validValues) => {
+        // Handle single value
+        if (typeof filterValue === 'string') {
+            if (!validValues.includes(filterValue)) {
+                console.warn(`Invalid enum value for ${field}: ${filterValue}. Removing filter.`);
+                return false;
+            }
+            return true;
+        }
+        
+        // Handle $in operator with array of values
+        if (filterValue && typeof filterValue === 'object' && filterValue.$in && Array.isArray(filterValue.$in)) {
+            const invalidValues = filterValue.$in.filter(val => !validValues.includes(val));
+            if (invalidValues.length > 0) {
+                console.warn(`Invalid enum values for ${field}: ${invalidValues.join(', ')}. Removing filter.`);
+                return false;
+            }
+            return true;
+        }
+        
+        return true;
+    };
+
     if (entity === "InventoryItem") {
         for (const [field, validValues] of Object.entries(InventoryItemEnums)) {
-            if (filters[field] && !validValues.includes(filters[field])) {
-                console.warn(`Invalid enum value for ${field}: ${filters[field]}. Removing filter.`);
-                delete filters[field];
+            if (filters[field]) {
+                if (!validateEnumField(field, filters[field], validValues)) {
+                    delete filters[field];
+                }
             }
         }
     }
 
     if (entity === "Customer") {
         for (const [field, validValues] of Object.entries(CustomerEnums)) {
-            if (filters[field] && !validValues.includes(filters[field])) {
-                console.warn(`Invalid enum value for ${field}: ${filters[field]}. Removing filter.`);
-                delete filters[field];
+            if (filters[field]) {
+                if (!validateEnumField(field, filters[field], validValues)) {
+                    delete filters[field];
+                }
             }
         }
     }
@@ -75,15 +149,36 @@ export const executeQuery = async (queryPlan) => {
         // Check if pipeline already has $limit stage
         const hasLimit = pipeline.some(stage => stage.$limit !== undefined);
 
-        // Add $project only if not already present and we have fields to return
-        if (!hasProject && fieldsToReturn.length > 0) {
+        // Check if pipeline uses grouped pattern (has $group with items field using $$ROOT)
+        // This pattern is used for per-category limiting with $setWindowFields
+        const hasGroupedPattern = pipeline.some(stage => {
+            if (stage.$group) {
+                const groupStage = stage.$group;
+                // Check if any field in the $group uses $push with "$$ROOT"
+                return Object.values(groupStage).some(value => {
+                    if (value && typeof value === 'object' && value.$push === "$$ROOT") {
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            return false;
+        });
+
+        // Add $project only if:
+        // 1. Not already present
+        // 2. We have fields to return
+        // 3. NOT using grouped pattern (because $$ROOT already includes all fields)
+        if (!hasProject && fieldsToReturn.length > 0 && !hasGroupedPattern) {
             const project = {};
             fieldsToReturn.forEach(f => (project[f] = 1));
             pipeline.push({ $project: project });
         }
 
-        // Add $limit only if not already present
-        if (!hasLimit) {
+        // Add $limit only if:
+        // 1. Not already present
+        // 2. NOT using grouped pattern (per-category limiting already handled via rank)
+        if (!hasLimit && !hasGroupedPattern) {
             pipeline.push({ $limit: validLimit });
         }
 

@@ -34,7 +34,7 @@ export const generateQueryPlan = async (prompt) => {
     });
 
     const content = response.choices[0].message.content;
-
+    console.log("content->", content);
     try {
         return JSON.parse(content);
     } catch (parseError) {
